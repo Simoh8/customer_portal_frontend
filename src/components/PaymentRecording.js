@@ -1,79 +1,43 @@
 import React, { useState, useEffect } from "react";
 
 function PaymentRecording() {
-  // Form state
   const [paymentData, setPaymentData] = useState({
     party: "",
     amount: "",
     invoice: "",
     mode_of_payment: "Cash",
-    payment_date: new Date().toISOString().split('T')[0]
+    payment_date: new Date().toISOString().split("T")[0],
+    mobile_number: "",
+    mpesa_code: ""
   });
 
-  // Payment history state
   const [payments, setPayments] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [invoices, setInvoices] = useState([]);
 
-  // Dummy data for fallback
-  const dummyPayments = [
-    {
-      name: "PAY-2023-001",
-      party: "Acme Corporation",
-      posting_date: "2023-06-01",
-      paid_amount: 500.50,
-      mode_of_payment: "Bank Transfer",
-      reference_no: "INV-2023-001"
-    },
-    {
-      name: "PAY-2023-002",
-      party: "Globex Inc.",
-      posting_date: "2023-06-05",
-      paid_amount: 890.00,
-      mode_of_payment: "Credit Card",
-      reference_no: "INV-2023-002"
-    }
-  ];
-
-  const dummyInvoices = [
-    { name: "INV-2023-001", customer: "Acme Corporation", outstanding_amount: 500.50 },
-    { name: "INV-2023-002", customer: "Globex Inc.", outstanding_amount: 0 },
-    { name: "INV-2023-003", customer: "Wayne Enterprises", outstanding_amount: 4200.00 }
-  ];
-
-  // Fetch payment history and invoices
   useEffect(() => {
     const fetchData = async () => {
       try {
         setLoading(true);
-        
-        // Try to fetch real data
         const [paymentsRes, invoicesRes] = await Promise.all([
-          fetch("/api/resource/Payment%20Entry?fields=[%22name%22,%22party%22,%22posting_date%22,%22paid_amount%22,%22mode_of_payment%22,%22reference_no%22]"),
+          fetch("/api/resource/Payment%20Entry?fields=[%22name%22,%22party%22,%22posting_date%22,%22paid_amount%22,%22mode_of_payment%22,%22reference_no%22,%22remarks%22]"),
           fetch("/api/resource/Sales%20Invoice?fields=[%22name%22,%22customer%22,%22outstanding_amount%22]&filters=[[%22outstanding_amount%22,%22%3E%22,0]]")
         ]);
 
-        // Process payments
         if (paymentsRes.ok) {
           const paymentsData = await paymentsRes.json();
-          setPayments(paymentsData.data || dummyPayments);
-        } else {
-          setPayments(dummyPayments);
+          setPayments(paymentsData.data || []);
         }
 
-        // Process invoices
         if (invoicesRes.ok) {
           const invoicesData = await invoicesRes.json();
-          setInvoices(invoicesData.data || dummyInvoices);
-        } else {
-          setInvoices(dummyInvoices);
+          setInvoices(invoicesData.data || []);
         }
-
       } catch (err) {
         setError("Failed to load data. Showing sample payments.");
-        setPayments(dummyPayments);
-        setInvoices(dummyInvoices);
+        setPayments([]);
+        setInvoices([]);
       } finally {
         setLoading(false);
       }
@@ -82,8 +46,78 @@ function PaymentRecording() {
     fetchData();
   }, []);
 
+  const confirmSTKPush = async (transactionId) => {
+    let attempts = 0;
+    while (attempts < 10) {
+      const res = await fetch(`/api/method/ledgerctrl.ledgerctrl.api.login_api.get_stk_status?transaction_id=${transactionId}`);
+      const data = await res.json();
+      if (data.success) return data;
+      await new Promise((resolve) => setTimeout(resolve, 3000));
+      attempts++;
+    }
+    throw new Error("M-Pesa payment not confirmed in time");
+  };
+
   const handleSubmit = async (e) => {
     e.preventDefault();
+
+    if (paymentData.mode_of_payment === "Mobile Money") {
+      try {
+          const stkRes = await fetch("/api/method/ledgerctrl.ledgerctrl.api.login_api.stkpush", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            phone: paymentData.mobile_number,
+            amount: parseFloat(paymentData.amount),
+            invoice: paymentData.invoice
+          }),
+        });
+
+        if (!stkRes.ok) throw new Error("STK Push failed");
+
+        const stkData = await stkRes.json();
+        const confirmed = await confirmSTKPush(stkData.transaction_id);
+
+        if (!confirmed.success) throw new Error("M-Pesa payment failed");
+
+        const mpesa_code = confirmed.mpesa_code;
+
+        const paymentRes = await fetch("/api/resource/Payment%20Entry", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            party_type: "Customer",
+            party: paymentData.party,
+            paid_amount: parseFloat(paymentData.amount),
+            payment_type: "Receive",
+            mode_of_payment: "Mobile Money",
+            reference_date: paymentData.payment_date,
+            reference_invoice: paymentData.name,
+            reference_no: mpesa_code,
+            remarks: `Paid via M-Pesa by ${paymentData.mobile_number}`,
+            references: [{
+              reference_doctype: "Sales Invoice",
+              reference_name: paymentData.invoice,
+              allocated_amount: paymentData.amount
+            }]
+          }),
+        });
+
+        if (paymentRes.ok) {
+          alert("Payment recorded successfully!");
+          window.location.reload();
+        } else {
+          throw new Error("Failed to record payment");
+        }
+
+      } catch (err) {
+        alert("Mobile payment failed: " + err.message);
+      }
+
+      return;
+    }
+
+    // Non-M-Pesa
     try {
       const response = await fetch("/api/resource/Payment%20Entry", {
         method: "POST",
@@ -95,6 +129,7 @@ function PaymentRecording() {
           payment_type: "Receive",
           mode_of_payment: paymentData.mode_of_payment,
           reference_date: paymentData.payment_date,
+          reference_invoice: paymentData.name,
           references: [{
             reference_doctype: "Sales Invoice",
             reference_name: paymentData.invoice,
@@ -105,7 +140,6 @@ function PaymentRecording() {
 
       if (response.ok) {
         alert("Payment recorded successfully!");
-        // Refresh payment list
         window.location.reload();
       } else {
         throw new Error("Failed to record payment");
@@ -116,9 +150,9 @@ function PaymentRecording() {
   };
 
   const formatCurrency = (amount) => {
-    return new Intl.NumberFormat('en-US', {
-      style: 'currency',
-      currency: 'USD',
+    return new Intl.NumberFormat("en-US", {
+      style: "currency",
+      currency: "USD"
     }).format(amount || 0);
   };
 
@@ -131,7 +165,7 @@ function PaymentRecording() {
             <label>Customer Name</label>
             <input
               value={paymentData.party}
-              onChange={(e) => setPaymentData({...paymentData, party: e.target.value})}
+              onChange={(e) => setPaymentData({ ...paymentData, party: e.target.value })}
               placeholder="Customer Name"
               required
             />
@@ -141,7 +175,7 @@ function PaymentRecording() {
             <label>Invoice Reference</label>
             <select
               value={paymentData.invoice}
-              onChange={(e) => setPaymentData({...paymentData, invoice: e.target.value})}
+              onChange={(e) => setPaymentData({ ...paymentData, invoice: e.target.value })}
               required
             >
               <option value="">Select Invoice</option>
@@ -159,7 +193,7 @@ function PaymentRecording() {
               <input
                 type="number"
                 value={paymentData.amount}
-                onChange={(e) => setPaymentData({...paymentData, amount: e.target.value})}
+                onChange={(e) => setPaymentData({ ...paymentData, amount: e.target.value })}
                 placeholder="Amount"
                 step="0.01"
                 min="0.01"
@@ -172,7 +206,7 @@ function PaymentRecording() {
               <input
                 type="date"
                 value={paymentData.payment_date}
-                onChange={(e) => setPaymentData({...paymentData, payment_date: e.target.value})}
+                onChange={(e) => setPaymentData({ ...paymentData, payment_date: e.target.value })}
                 required
               />
             </div>
@@ -182,7 +216,7 @@ function PaymentRecording() {
             <label>Payment Method</label>
             <select
               value={paymentData.mode_of_payment}
-              onChange={(e) => setPaymentData({...paymentData, mode_of_payment: e.target.value})}
+              onChange={(e) => setPaymentData({ ...paymentData, mode_of_payment: e.target.value })}
               required
             >
               <option value="Cash">Cash</option>
@@ -190,8 +224,34 @@ function PaymentRecording() {
               <option value="Credit Card">Credit Card</option>
               <option value="Check">Check</option>
               <option value="Online Payment">Online Payment</option>
+              <option value="Mobile Money">Mobile Money</option>
             </select>
           </div>
+
+          {paymentData.mode_of_payment === "Mobile Money" && (
+            <>
+              <div className="form-group">
+                <label>Mobile Number</label>
+                <input
+                  type="tel"
+                  placeholder="e.g. 254712345678"
+                  value={paymentData.mobile_number}
+                  onChange={(e) => setPaymentData({ ...paymentData, mobile_number: e.target.value })}
+                  required
+                />
+              </div>
+
+              <div className="form-group">
+                <label>M-Pesa Transaction Code</label>
+                <input
+                  type="text"
+                  placeholder="Will be auto-filled"
+                  value={paymentData.mpesa_code}
+                  readOnly
+                />
+              </div>
+            </>
+          )}
 
           <button type="submit" className="submit-btn">
             Record Payment
@@ -202,9 +262,9 @@ function PaymentRecording() {
       <div className="payment-history-section">
         <h2>Payment History</h2>
         {error && <div className="error-notice">{error}</div>}
-        
+
         <div className="payment-cards">
-          {(loading ? dummyPayments : payments).map(payment => (
+          {(loading ? [] : payments).map(payment => (
             <div key={payment.name} className="payment-card">
               <div className="payment-card-header">
                 <h3>{payment.name}</h3>
@@ -212,10 +272,10 @@ function PaymentRecording() {
                   {new Date(payment.posting_date).toLocaleDateString()}
                 </span>
               </div>
-              
+
               <div className="payment-card-body">
                 <div className="payment-party">{payment.party}</div>
-                
+
                 <div className="payment-details">
                   <div>
                     <span className="detail-label">Amount:</span>
@@ -227,8 +287,14 @@ function PaymentRecording() {
                   </div>
                   {payment.reference_no && (
                     <div>
-                      <span className="detail-label">Invoice:</span>
+                      <span className="detail-label">Transaction Code:</span>
                       <span>{payment.reference_no}</span>
+                    </div>
+                  )}
+                  {payment.remarks && (
+                    <div>
+                      <span className="detail-label">Remarks:</span>
+                      <span>{payment.remarks}</span>
                     </div>
                   )}
                 </div>
